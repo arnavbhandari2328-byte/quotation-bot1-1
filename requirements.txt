@@ -1,6 +1,4 @@
-flask
-gunicorn
-requests
-google-generativeai
+Flask
+google-genai
 docxtpl
-python-docx
+requests
