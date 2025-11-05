@@ -1,284 +1,388 @@
+# app.py
 import os
 import re
-import json
-import base64
-import datetime
-import smtplib
+import gc
 import ssl
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.application import MIMEApplication
-
+import json
+import time
+import smtplib
+import datetime
+from email.message import EmailMessage
 from flask import Flask, request, Response, jsonify
+from docxtpl import DocxTemplate
 import requests
 
-# ---------- ENV ----------
-GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY")
+# -------- Optional (but recommended) --------
+# Gemini (Google Generative AI)
+# pip install google-generativeai
+import google.generativeai as genai
 
-META_ACCESS_TOKEN = os.environ.get("META_ACCESS_TOKEN")
-PHONE_NUMBER_ID   = os.environ.get("PHONE_NUMBER_ID")
-META_VERIFY_TOKEN = os.environ.get("META_VERIFY_TOKEN")
 
-# Zoho Mail SMTP
-ZOHO_EMAIL        = os.environ.get("ZOHO_EMAIL")
-ZOHO_APP_PASSWORD = os.environ.get("ZOHO_APP_PASSWORD")
-SMTP_SERVER       = os.environ.get("SMTP_SERVER", "smtp.zoho.in")
-SMTP_PORT         = int(os.environ.get("SMTP_PORT", "465"))
-
+# =========================
+# Environment & Constants
+# =========================
 TEMPLATE_FILE = "Template.docx"
 
-# ---------- APP ----------
+# WhatsApp / Meta
+META_ACCESS_TOKEN = os.environ.get("META_ACCESS_TOKEN") or os.environ.get("WHATSApp_TOKEN") or os.environ.get("WHATSAPP_TOKEN")
+PHONE_NUMBER_ID   = os.environ.get("PHONE_NUMBER_ID")
+META_VERIFY_TOKEN = os.environ.get("META_VERIFY_TOKEN") or os.environ.get("VERIFY_TOKEN")
+
+# Gemini
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+# Zoho SMTP
+ZOHO_EMAIL        = os.environ.get("ZOHO_EMAIL")                         # e.g. arnavbhandari2328@zohomail.in
+ZOHO_APP_PASSWORD = os.environ.get("ZOHO_APP_PASSWORD")                  # App-specific password
+SMTP_SERVER       = os.environ.get("SMTP_SERVER", "smtp.zoho.in")        # or smtp.zoho.com
+SMTP_PORT         = int(os.environ.get("SMTP_PORT", "587"))              # we’ll try both 587 and 465 anyway
+SENDER_NAME       = os.environ.get("ZOHO_SENDER_NAME", "NIVEE METAL PRODUCTS PVT LTD")
+
+# Conservative worker settings for Render free tier
+WEB_CONCURRENCY = int(os.environ.get("WEB_CONCURRENCY", "1"))
+
+# Flask
 app = Flask(__name__)
 
-@app.get("/")
-def root():
-    return jsonify(service="quotation-bot", status="ok",
-                   time=str(datetime.datetime.utcnow()) + "Z")
 
-@app.get("/health")
-def health():
-    missing = [k for k, v in {
-        "GEMINI_API_KEY": GEMINI_API_KEY,
-        "META_ACCESS_TOKEN": META_ACCESS_TOKEN,
-        "PHONE_NUMBER_ID": PHONE_NUMBER_ID,
-        "META_VERIFY_TOKEN": META_VERIFY_TOKEN,
-        "ZOHO_EMAIL": ZOHO_EMAIL,
-        "ZOHO_APP_PASSWORD": ZOHO_APP_PASSWORD,
-    }.items() if not v]
-    return jsonify(ok=len(missing) == 0, missing=missing)
+# =========================
+# Init Gemini
+# =========================
+if GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        GEMINI_MODEL = genai.GenerativeModel("gemini-pro")
+        print("Gemini configured.")
+    except Exception as e:
+        GEMINI_MODEL = None
+        print(f"!!! CRITICAL: Could not configure Gemini: {e}")
+else:
+    GEMINI_MODEL = None
+    print("!!! WARNING: GEMINI_API_KEY not set. AI parsing will not work.")
 
 
-# ---------- WhatsApp reply ----------
-def send_whatsapp_reply(to_phone_number: str, message_text: str) -> None:
-    if not META_ACCESS_TOKEN or not PHONE_NUMBER_ID:
-        print("!!! ERROR: Meta API keys missing; cannot send reply.")
+# =========================
+# Helpers
+# =========================
+def send_whatsapp_reply(to_phone_number: str, message_text: str):
+    """Send a simple WhatsApp text message back to the user via Meta."""
+    if not (META_ACCESS_TOKEN and PHONE_NUMBER_ID):
+        print("!!! ERROR: Missing META_ACCESS_TOKEN or PHONE_NUMBER_ID. Cannot send WhatsApp reply.")
         return
+
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {META_ACCESS_TOKEN}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
     payload = {
         "messaging_product": "whatsapp",
         "to": to_phone_number,
         "type": "text",
-        "text": {"body": message_text}
+        "text": {"body": message_text},
     }
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=20)
-        resp.raise_for_status()
-        print(f"✅ WhatsApp reply sent to {to_phone_number}")
-    except requests.exceptions.RequestException as e:
-        print(f"!!! WhatsApp send error: {e} :: {getattr(e, 'response', None) and e.response.text}")
+        r = requests.post(url, headers=headers, json=payload, timeout=15)
+        r.raise_for_status()
+        print(f"WhatsApp reply sent to {to_phone_number}")
+    except Exception as e:
+        print(f"!!! ERROR sending WhatsApp reply: {e}")
+        try:
+            print(f"Response: {r.status_code} {r.text}")
+        except Exception:
+            pass
 
 
-# ---------- AI parse (Gemini; lazy import) ----------
-def parse_command_with_ai(command_text: str):
+def _clean_json_text(text: str) -> str:
+    """Remove code fences if model decides to return ```json ... ```."""
+    if not text:
+        return ""
+    t = text.strip()
+    t = t.replace("```json", "").replace("```", "").strip()
+    return t
+
+
+def parse_command_with_ai(user_text: str):
+    """Ask Gemini to extract a structured quotation. Return dict or None."""
     print("Sending command to Google AI (Gemini) for parsing...")
+
+    if not GEMINI_MODEL:
+        print("!!! ERROR: Gemini model unavailable.")
+        return None
+
+    today_str = datetime.date.today().strftime("%B %d, %Y")
+
+    prompt = f"""
+You are a quotation data extractor. Read the user's WhatsApp message and return ONLY a compact JSON object.
+
+Message:
+{user_text}
+
+Rules:
+- Return JSON with ALL keys: "q_no","date","company_name","customer_name","product","quantity","rate","units","hsn","email".
+- If a field is missing, use an empty string "" (do not omit fields).
+- "date": If missing, use "{today_str}".
+- "quantity": only the integer amount (no unit). If unclear, use "".
+- "rate": only the numeric amount per unit (no currency). If unclear, use "".
+- "units": typical values are "Pcs","Nos","Kgs". Default "Nos" if not specified.
+- DO NOT include extra text, code fences, or comments.
+
+Return strictly the JSON.
+"""
+
     try:
-        import google.generativeai as genai  # lazy import to reduce startup cost
-        if not GEMINI_API_KEY:
-            print("!!! ERROR: GEMINI_API_KEY not set.")
-            return None
-        genai.configure(api_key=GEMINI_API_KEY)
-
-        model = genai.GenerativeModel('models/gemini-pro-latest')
-        today = datetime.date.today().strftime('%B %d, %Y')
-
-        system_prompt = f"""
-        You are an assistant for a stainless steel trader. Extract a quotation.
-
-        Date today: {today}
-
-        Extract:
-        - q_no
-        - date (default: today's date)
-        - company_name
-        - customer_name
-        - product
-        - quantity (ONLY the number)
-        - rate (number)
-        - units (default "Nos")
-        - hsn
-        - email
-
-        Return ONLY a single minified JSON string. No extra words or code fences.
-
-        Example:
-        User: "quote 101 for Raju at Raj pvt ltd, 500 pcs 3in pipe at 600, hsn 7304, email raju@gmail.com"
-        AI: {{"q_no":"101","date":"{today}","company_name":"Raj pvt ltd","customer_name":"Raju","product":"3in pipe","quantity":"500","rate":"600","units":"Pcs","hsn":"7304","email":"raju@gmail.com"}}
-        """
-        response = model.generate_content(system_prompt + "\n\nUser: " + command_text)
-        ai_text = (response.text or "").strip().replace("```json", "").replace("```", "").strip()
+        resp = GEMINI_MODEL.generate_content(prompt)
+        ai_text = _clean_json_text(getattr(resp, "text", "") or "")
         print(f"AI response received: {ai_text}")
+        data = json.loads(ai_text or "{}")
 
-        context = json.loads(ai_text)
+        # basic validation + normalization
+        for k in ["q_no","date","company_name","customer_name","product","quantity","rate","units","hsn","email"]:
+            data.setdefault(k, "")
 
-        # Required fields
-        for f in ['product', 'customer_name', 'email', 'rate', 'quantity']:
-            if not str(context.get(f, "")).strip():
-                print(f"!!! ERROR: Missing field {f}")
+        # Required fields to continue
+        required = ["customer_name", "product", "quantity", "rate", "email"]
+        for k in required:
+            if not str(data.get(k, "")).strip():
+                print(f"!!! ERROR: Missing field {k}")
                 return None
 
-        # Numbers & totals
+        # Clean numbers
         try:
-            qty  = int(re.sub(r"[^\d]", "", str(context['quantity'])))
-            rate = float(str(context['rate']).replace(",", "").strip())
-            total = qty * rate
-            context['quantity'] = str(qty)
-            context['rate_formatted'] = f"₹{rate:,.2f}"
-            context['total'] = f"₹{total:,.2f}"
-            context['rate'] = context['rate_formatted']
-        except ValueError:
-            print("!!! ERROR: Invalid rate/quantity.")
+            qty_num = int(re.sub(r"[^\d]", "", str(data["quantity"])))
+        except Exception:
+            print("!!! ERROR: quantity not integer.")
             return None
 
-        # Defaults
-        context.setdefault('date', today)
-        context.setdefault('company_name', "")
-        context.setdefault('hsn', "")
-        context.setdefault('q_no', "")
-        context['units'] = context.get('units') or "Nos"
+        try:
+            rate_num = float(re.sub(r"[^\d.]", "", str(data["rate"])))
+        except Exception:
+            print("!!! ERROR: rate not number.")
+            return None
 
-        print(f"Parsed context: {context}")
-        return context
+        total_num = qty_num * rate_num
+        data["quantity"] = str(qty_num)
+        data["rate"] = f"{rate_num:.2f}"
+        data["rate_formatted"] = f"₹{rate_num:,.2f}"
+        data["total"] = f"₹{total_num:,.2f}"
+        if not data["date"]:
+            data["date"] = today_str
+        if not data["units"]:
+            data["units"] = "Nos"
+
+        print(f"Parsed context: {data}")
+        return data
 
     except Exception as e:
-        print(f"!!! AI error: {e}")
+        print(f"!!! ERROR during AI parse: {e}")
         return None
 
 
-# ---------- DOCX generation (docxtpl) ----------
-def create_quotation_from_template(context) -> str | None:
+def create_quotation_from_template(context: dict) -> str | None:
+    """Render Template.docx with context and save to /tmp. Return path or None."""
     try:
-        from docxtpl import DocxTemplate
         script_dir = os.path.dirname(os.path.abspath(__file__))
         template_path = os.path.join(script_dir, TEMPLATE_FILE)
         doc = DocxTemplate(template_path)
-        doc.render(context)
+    except Exception as e:
+        print(f"!!! ERROR: Could not load template '{TEMPLATE_FILE}'. Error: {e}")
+        return None
 
-        safe = "".join(c for c in context['customer_name'] if c.isalnum() or c in " _-").rstrip()
-        filename = f"Quotation_{safe}_{datetime.date.today()}.docx"
-        out_path = os.path.join("/tmp", filename)  # temp dir on Render
+    try:
+        doc.render(context)
+        safe_name = "".join(c for c in context["customer_name"] if c.isalnum() or c in " _-").rstrip() or "Customer"
+        filename = f"Quotation_{safe_name}_{datetime.date.today()}.docx"
+        out_path = os.path.join("/tmp", filename)  # use ephemeral disk on Render
         doc.save(out_path)
         print(f"✅ DOCX created: '{out_path}'")
         return out_path
     except Exception as e:
-        print(f"!!! DOCX error: {e}")
+        print(f"!!! ERROR rendering or saving the document: {e}")
         return None
+    finally:
+        gc.collect()
 
 
-# ---------- Email via Zoho SMTP ----------
-def send_email_with_attachment(recipient_email: str, subject: str, body_html: str, attachment_path: str) -> bool:
-    if not all([ZOHO_EMAIL, ZOHO_APP_PASSWORD, attachment_path]):
-        print("Email prerequisites missing.")
+def send_email_with_attachment(recipient_email: str, subject: str, body: str, attachment_path: str) -> bool:
+    """Send email via Zoho. Try STARTTLS:587, then SSL:465 fallback."""
+    if not attachment_path:
+        print("Cannot send email, no attachment was created.")
         return False
+
+    if not (ZOHO_EMAIL and ZOHO_APP_PASSWORD):
+        print("!!! ERROR: ZOHO_EMAIL or ZOHO_APP_PASSWORD missing.")
+        return False
+
+    # Build message
+    msg = EmailMessage()
+    display_from = f"{SENDER_NAME} <{ZOHO_EMAIL}>" if SENDER_NAME else ZOHO_EMAIL
+    msg["From"] = display_from
+    msg["To"] = recipient_email
+    msg["Subject"] = subject
+    msg.set_content(body)
+
     try:
-        msg = MIMEMultipart()
-        msg["From"] = ZOHO_EMAIL
-        msg["To"] = recipient_email
-        msg["Subject"] = subject
-        msg.attach(MIMEText(body_html, "html"))
-
         with open(attachment_path, "rb") as f:
-            part = MIMEApplication(f.read(), Name=os.path.basename(attachment_path))
-            part['Content-Disposition'] = f'attachment; filename="{os.path.basename(attachment_path)}"'
-            msg.attach(part)
+            data = f.read()
+        msg.add_attachment(
+            data,
+            maintype="application",
+            subtype="vnd.openxmlformats-officedocument.wordprocessingml.document",
+            filename=os.path.basename(attachment_path),
+        )
+    except Exception as e:
+        print("Attach error:", e)
+        return False
 
-        ctx = ssl.create_default_context()
-        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=ctx) as server:
-            server.login(ZOHO_EMAIL, ZOHO_APP_PASSWORD)
-            server.send_message(msg)
+    # 1) STARTTLS on 587
+    try:
+        host = SMTP_SERVER
+        print(f"SMTP: trying STARTTLS {host}:587 …")
+        with smtplib.SMTP(host, 587, timeout=20) as smtp:
+            smtp.ehlo()
+            smtp.starttls(context=ssl.create_default_context())
+            smtp.ehlo()
+            smtp.login(ZOHO_EMAIL, ZOHO_APP_PASSWORD)
+            smtp.send_message(msg)
+        print(f"Email sent to {recipient_email} via TLS:587")
+        return True
+    except Exception as e1:
+        print("SMTP STARTTLS failed:", e1)
 
-        print(f"✅ Email sent via Zoho Mail to {recipient_email}")
-        # cleanup temp file
+    # 2) SSL on 465 fallback
+    try:
+        print(f"SMTP: trying SSL {host}:465 …")
+        with smtplib.SMTP_SSL(host, 465, timeout=20, context=ssl.create_default_context()) as smtp:
+            smtp.login(ZOHO_EMAIL, ZOHO_APP_PASSWORD)
+            smtp.send_message(msg)
+        print(f"Email sent to {recipient_email} via SSL:465")
+        return True
+    except Exception as e2:
+        print("SMTP SSL failed:", e2)
+        return False
+    finally:
+        # Always try to cleanup the temp file
         try:
             os.remove(attachment_path)
-        except Exception as e:
-            print(f"Warn: could not delete temp file: {e}")
-        return True
-    except Exception as e:
-        print(f"❌ Email send error: {e}")
-        return False
+            print(f"Cleaned up '{attachment_path}'")
+        except Exception:
+            pass
 
 
-# ---------- Webhook (Meta verification + events) ----------
+# =========================
+# Flask Routes
+# =========================
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify({
+        "service": "quotation-bot",
+        "status": "ok",
+        "time": datetime.datetime.utcnow().isoformat() + "Z"
+    })
+
+
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
+    # --- Verification (GET) ---
     if request.method == "GET":
-        # Webhook verification
-        mode = request.args.get('hub.mode')
-        token = request.args.get('hub.verify_token')
-        challenge = request.args.get('hub.challenge')
-        if mode == 'subscribe' and token == META_VERIFY_TOKEN:
-            print("✅ WEBHOOK VERIFIED SUCCESSFULLY!")
-            return Response(challenge, status=200)
-        print("❌ Webhook verification failed")
-        return Response("Verification token mismatch", status=403)
+        print("Webhook GET (verify) received")
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
+        if mode == "subscribe" and token and challenge:
+            if token == META_VERIFY_TOKEN:
+                print("Verification successful.")
+                return Response(challenge, status=200)
+            print("Verification token mismatch.")
+            return Response("Verification token mismatch", status=403)
+        return Response("Bad verify request", status=400)
 
-    # POST — message or status update
+    # --- Messages (POST) ---
     print("Webhook POST received")
+    data = request.json or {}
+
+    # Navigate Meta's structure
     try:
-        data = request.get_json(silent=True) or {}
-        change = (data.get('entry', [{}])[0].get('changes') or [{}])[0]
-        val = change.get('value', {})
-
-        # Received user message
-        if val.get('messages'):
-            msg = val['messages'][0]
-            if msg.get('type') != 'text':
-                print(f"Ignoring non-text message: {msg.get('type')}")
-                return Response(status=200)
-
-            customer_phone = msg['from']
-            user_text = msg['text']['body']
-
-            # Parse
-            context = parse_command_with_ai(user_text)
-            if not context:
-                send_whatsapp_reply(customer_phone, "Sorry, I couldn't understand your request. Please re-check and try again.")
-                return Response(status=200)
-
-            # Create DOCX
-            doc_file = create_quotation_from_template(context)
-            if not doc_file:
-                send_whatsapp_reply(customer_phone, "Sorry, an internal error occurred while creating your document.")
-                return Response(status=200)
-
-            # Email
-            subject = f"Quotation from NIVEE METAL PRODUCTS PVT LTD (Ref: {context.get('q_no','N/A')})"
-            body_html = f"""
-            <p>Dear {context['customer_name']},</p>
-            <p>Thank you for your enquiry.</p>
-            <p>Please find our official quotation attached.</p>
-            <p>Regards,<br>Harsh Bhandari<br>Nivee Metal Products Pvt. Ltd.</p>
-            """
-            ok = send_email_with_attachment(context['email'], subject, body_html, doc_file)
-
-            if ok:
-                send_whatsapp_reply(customer_phone, f"Success! Your quotation for {context['product']} has been emailed to {context['email']}.")
-            else:
-                send_whatsapp_reply(customer_phone, f"Sorry, I created the quote but couldn't send the email to {context['email']}.")
-
-            return Response(status=200)
-
-        # Ignore delivery/read/status events
-        if val.get('statuses'):
-            st = val['statuses'][0]
-            print(f"Status update: {st.get('status')} for message {st.get('id')}")
-            return Response(status=200)
-
-        print("No messages or statuses in webhook; ignoring.")
+        change = data["entry"][0]["changes"][0]
+    except Exception:
+        print("No entry/changes in payload.")
         return Response(status=200)
 
-    except Exception as e:
-        print(f"Webhook handling error: {e}")
-        print(f"Raw body: {request.data}")
+    # New incoming message
+    if "messages" in change.get("value", {}) and change["value"]["messages"]:
+        msg = change["value"]["messages"][0]
+        if msg.get("type") != "text":
+            print(f"Ignoring non-text message type: {msg.get('type')}")
+            return Response(status=200)
+
+        from_number = msg["from"]
+        user_text = msg["text"]["body"]
+        print(f"Incoming text from {from_number}: {user_text!r}")
+
+        context = parse_command_with_ai(user_text)
+        gc.collect()  # free memory after AI call
+
+        if not context:
+            send_whatsapp_reply(from_number,
+                                "Sorry, I couldn't read all details. Please send like:\n"
+                                "Name: Raju\nProduct: 5 inch SS 316L sheets\nQuantity: 5\nRate: 25000\nUnits: Pcs\nEmail: raju@example.com")
+            return Response(status=200)
+
+        # Create the DOCX
+        print(f"Generating quote for {context['customer_name']}...")
+        doc_file = create_quotation_from_template(context)
+        if not doc_file:
+            send_whatsapp_reply(from_number, "Sorry, I couldn't create the quotation DOCX.")
+            return Response(status=200)
+
+        # Build email
+        subject = f"Quotation from {SENDER_NAME} (Ref: {context.get('q_no', 'N/A')})"
+        body = (
+            f"Dear {context['customer_name']},\n\n"
+            f"Thank you for your enquiry.\n\n"
+            f"Please find our official quotation attached for:\n"
+            f"• Product: {context['product']}\n"
+            f"• Quantity: {context['quantity']} {context['units']}\n"
+            f"• Rate: {context['rate_formatted']} per {context['units']}\n"
+            f"• Total: {context['total']}\n\n"
+            f"Regards,\n{SENDER_NAME}\n"
+        )
+
+        ok = send_email_with_attachment(context["email"], subject, body, doc_file)
+
+        if ok:
+            send_whatsapp_reply(
+                from_number,
+                f"✅ Success! Your quotation for {context['product']} was created and emailed to {context['email']}."
+            )
+        else:
+            send_whatsapp_reply(
+                from_number,
+                f"⚠️ Created the quotation but couldn't send email to {context['email']}. "
+                f"Please check the email or try again."
+            )
+
         return Response(status=200)
 
+    # Status updates (sent/delivered/read)
+    if "statuses" in change.get("value", {}):
+        st = change["value"]["statuses"][0]
+        print(f"Status update: {st.get('status')} for message {st.get('id')}.")
+        return Response(status=200)
 
-# ---------- Local run (Render uses Gunicorn) ----------
+    print("Change without messages or statuses. Ignoring.")
+    return Response(status=200)
+
+
+# =========================
+# Run (for local dev)
+# =========================
 if __name__ == "__main__":
+    if not all([META_ACCESS_TOKEN, PHONE_NUMBER_ID, META_VERIFY_TOKEN]):
+        print("!!! WARNING: Some WhatsApp env vars missing.")
+    if not (ZOHO_EMAIL and ZOHO_APP_PASSWORD):
+        print("!!! WARNING: Zoho SMTP env vars missing.")
+
     port = int(os.environ.get("PORT", 5000))
     print(f"Starting Flask on 0.0.0.0:{port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port)
