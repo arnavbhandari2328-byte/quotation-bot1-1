@@ -1,1 +1,1 @@
-web: gunicorn app:app
+web: gunicorn app:app --workers 1 --threads 2 --timeout 120 --max-requests 50 --max-requests-jitter 20 --worker-tmp-dir /dev/shm

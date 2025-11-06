@@ -1,277 +1,197 @@
 import os
-import json
-import re
 import base64
 from datetime import datetime
 
-import requests
 from flask import Flask, request, jsonify
-
-# ---------- Gmail (OAuth via Gmail API) ----------
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
-# ---------- Flask ----------
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email import encoders
+
+from docx import Document
+
 app = Flask(__name__)
 
-# =========================
-#  Environment Variables
-# =========================
-# WhatsApp Cloud API
-WA_VERIFY_TOKEN = os.getenv("WA_VERIFY_TOKEN", "verifyme")  # used by FB webhook verify
-WA_ACCESS_TOKEN = os.getenv("WA_ACCESS_TOKEN")              # permanent token
-WA_PHONE_NUMBER_ID = os.getenv("WA_PHONE_NUMBER_ID")        # your sender phone number id
+# ------------ ENV needed ------------
+REQUIRED_ENV = [
+    "GMAIL_CLIENT_ID",
+    "GMAIL_CLIENT_SECRET",
+    "GMAIL_REFRESH_TOKEN",
+    "GMAIL_SENDER",
+]
 
-# Gmail OAuth (no SMTP)
-GMAIL_CLIENT_ID = os.getenv("GMAIL_CLIENT_ID")
-GMAIL_CLIENT_SECRET = os.getenv("GMAIL_CLIENT_SECRET")
-GMAIL_REFRESH_TOKEN = os.getenv("GMAIL_REFRESH_TOKEN")
-GMAIL_SENDER = os.getenv("GMAIL_SENDER")  # the Gmail account you’ll send from
+def have_gmail_env():
+    return all(os.getenv(k) for k in REQUIRED_ENV)
 
-# =========================
-#  Helpers
-# =========================
-
-def ok_health():
-    return {
-        "service": "quotation-bot",
-        "status": "ok",
-        "time": datetime.utcnow().isoformat() + "Z",
-    }
-
-def _gmail_creds():
-    """Build Google OAuth Credentials using a refresh token."""
-    missing = [k for k,v in {
-        "GMAIL_CLIENT_ID": GMAIL_CLIENT_ID,
-        "GMAIL_CLIENT_SECRET": GMAIL_CLIENT_SECRET,
-        "GMAIL_REFRESH_TOKEN": GMAIL_REFRESH_TOKEN,
-        "GMAIL_SENDER": GMAIL_SENDER,
-    }.items() if not v]
-    if missing:
-        raise RuntimeError(f"Missing Gmail env vars: {', '.join(missing)}")
-
-    return Credentials(
+def gmail_service():
+    creds = Credentials(
         token=None,
-        refresh_token=GMAIL_REFRESH_TOKEN,
-        client_id=GMAIL_CLIENT_ID,
-        client_secret=GMAIL_CLIENT_SECRET,
+        refresh_token=os.environ["GMAIL_REFRESH_TOKEN"],
         token_uri="https://oauth2.googleapis.com/token",
+        client_id=os.environ["GMAIL_CLIENT_ID"],
+        client_secret=os.environ["GMAIL_CLIENT_SECRET"],
         scopes=["https://www.googleapis.com/auth/gmail.send"],
     )
+    return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
-def send_gmail(to_email: str, subject: str, html_body: str, text_body: str = None):
-    """Send email via Gmail API."""
-    creds = _gmail_creds()
-    service = build("gmail", "v1", credentials=creds)
+# ------------ Template helpers ------------
 
-    msg = MIMEMultipart("alternative")
-    msg["From"] = GMAIL_SENDER
-    msg["To"] = to_email
-    msg["Subject"] = subject
+def _replace_in_paragraph(paragraph, mapping):
+    # Merge all runs, then rebuild – robust placeholder replacement
+    if not paragraph.runs:
+        paragraph.text = _replace_text(paragraph.text, mapping)
+        return
+    text = "".join(run.text for run in paragraph.runs)
+    new_text = _replace_text(text, mapping)
+    for _ in range(len(paragraph.runs) - 1):
+        paragraph.runs[-1].clear()
+        paragraph._p.remove(paragraph.runs[-1]._r)
+    paragraph.runs[0].text = new_text
 
-    if text_body:
-        msg.attach(MIMEText(text_body, "plain"))
-    msg.attach(MIMEText(html_body, "html"))
+def _replace_text(text, mapping):
+    if not text:
+        return text
+    for k, v in mapping.items():
+        text = text.replace(k, v)
+    return text
 
-    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
-    message = {"raw": raw}
-    sent = service.users().messages().send(userId="me", body=message).execute()
-    return sent.get("id")
+def fill_docx_template(template_path, mapping, out_path):
+    doc = Document(template_path)
+    # paragraphs
+    for p in doc.paragraphs:
+        _replace_in_paragraph(p, mapping)
+    # tables
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    _replace_in_paragraph(p, mapping)
+    doc.save(out_path)
+    return out_path
 
-def send_whatsapp_text(to_phone_e164: str, body: str):
-    """Send a text message via WhatsApp Cloud API."""
-    if not all([WA_ACCESS_TOKEN, WA_PHONE_NUMBER_ID]):
-        print("WhatsApp keys missing; cannot send reply.")
-        return None
+# ------------ Quote builder (using your template) ------------
 
-    url = f"https://graph.facebook.com/v19.0/{WA_PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WA_ACCESS_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to_phone_e164,
-        "type": "text",
-        "text": {"body": body}
-    }
-    resp = requests.post(url, headers=headers, json=payload, timeout=30)
+def build_quote_from_template(data: dict) -> str:
+    # numbers / total formatting
+    rate_text = str(data.get("rate", ""))
+    qty_text = str(data.get("quantity", ""))
+    total_text = str(data.get("total", ""))
+
     try:
-        return resp.json()
-    except Exception:
-        return {"status_code": resp.status_code, "text": resp.text}
-
-def parse_fields(msg: str):
-    """
-    Very simple local parser (no Gemini). Accepts free-form or key:value lines.
-    Fields: customer_name, product, quantity, rate, units, email.
-    """
-    text = msg.strip()
-
-    # Key-value style
-    kv = {}
-    for line in text.splitlines():
-        if ":" in line:
-            k, v = line.split(":", 1)
-            kv[k.strip().lower()] = v.strip()
-
-    # Try KV first
-    name = kv.get("name") or kv.get("customer") or kv.get("customer name")
-    product = kv.get("product")
-    quantity = kv.get("quantity") or kv.get("qty")
-    rate = kv.get("rate") or kv.get("price")
-    units = kv.get("units") or kv.get("unit")
-    email = kv.get("email")
-
-    # Fallback regex for single line messages
-    def r(pattern):
-        m = re.search(pattern, text, re.I)
-        return m.group(1).strip() if m else None
-
-    if not name:
-        name = r(r"name\s*[:\-]\s*([^\n,]+)")
-    if not product:
-        product = r(r"product\s*[:\-]\s*([^\n,]+)")
-    if not quantity:
-        quantity = r(r"quantity\s*[:\-]\s*([0-9]+)")
-    if not rate:
-        rate = r(r"rate\s*[:\-]\s*([0-9,]+)")
-    if not units:
-        units = r(r"units\s*[:\-]\s*([^\n,]+)")
-    if not email:
-        email = r(r"email\s*[:\-]\s*([\w\.\-\+]+@[\w\.\-]+\.[A-Za-z]{2,})")
-
-    # Normalize
-    if rate:
-        rate = re.sub(r"[^\d]", "", rate) or rate
-    if quantity:
-        quantity = re.sub(r"[^\d]", "", quantity) or quantity
-
-    # Build context
-    ctx = {
-        "customer_name": name,
-        "product": product,
-        "quantity": quantity,
-        "rate": rate,
-        "units": units,
-        "email": email
-    }
-    return ctx
-
-def missing_fields(ctx):
-    req = ["customer_name", "product", "quantity", "rate", "units", "email"]
-    return [k for k in req if not ctx.get(k)]
-
-def html_quote(ctx):
-    total = ""
-    try:
-        if ctx.get("quantity") and ctx.get("rate"):
-            total_v = int(ctx["quantity"]) * int(ctx["rate"])
-            total = f"{total_v:,}"
+        rate_num = float(str(rate_text).replace(",", "").replace("₹", ""))
+        qty_num = float(str(qty_text).replace(",", ""))
+        rate_text = f"₹{rate_num:,.2f}"
+        total_text = f"₹{rate_num * qty_num:,.2f}"
     except Exception:
         pass
 
-    return f"""
-    <div>
-      <p>Dear {ctx['customer_name']},</p>
-      <p>Please find your quotation below:</p>
-      <table border="1" cellspacing="0" cellpadding="6">
-        <tr><th align="left">Product</th><td>{ctx['product']}</td></tr>
-        <tr><th align="left">Quantity</th><td>{ctx['quantity']} {ctx['units']}</td></tr>
-        <tr><th align="left">Rate</th><td>{ctx['rate']} per {ctx['units']}</td></tr>
-        <tr><th align="left">Total</th><td>{total if total else '-'}</td></tr>
-      </table>
-      <p>Regards,<br/>NIVEE METAL PRODUCTS PVT LTD</p>
-    </div>
-    """.strip()
+    mapping = {
+        "{{Q_NO}}":          str(data.get("q_no", "")),
+        "{{DATE}}":          str(data.get("date", datetime.utcnow().strftime("%Y-%m-%d"))),
+        "{{COMPANY_NAME}}":  str(data.get("company_name", "")),
+        "{{CUSTOMER_NAME}}": str(data.get("customer_name", "")),
+        "{{PRODUCT}}":       str(data.get("product", "")),
+        "{{QUANTITY}}":      str(qty_text),
+        "{{UNITS}}":         str(data.get("units", "")),
+        "{{RATE}}":          str(rate_text),
+        "{{HSN}}":           str(data.get("hsn", "")),
+        "{{TOTAL}}":         str(total_text),
+    }
 
-PROMPT_EXAMPLE = (
-    "Sorry, I couldn't read all details. Please send like:\n\n"
-    "Name: Raju\n"
-    "Product: 5 inch SS 316L sheets\n"
-    "Quantity: 5\n"
-    "Rate: 25000\n"
-    "Units: Pcs\n"
-    "Email: raju@example.com"
-)
+    template_path = os.path.join(os.path.dirname(__file__), "Template.docx")
+    if not os.path.exists(template_path):
+        raise RuntimeError("Template.docx not found in repo root")
 
-# =========================
-#  Routes
-# =========================
+    customer_safe = (data.get("customer_name") or "Customer").strip().replace(" ", "_")
+    date_safe = (data.get("date") or datetime.utcnow().strftime("%Y-%m-%d"))
+    out_path = f"/tmp/Quotation_{customer_safe}_{date_safe}.docx"
 
-@app.route("/", methods=["GET"])
-def root():
-    return jsonify(ok_health())
+    return fill_docx_template(template_path, mapping, out_path)
 
-@app.route("/webhook", methods=["GET"])
-def webhook_verify():
-    """
-    Facebook / WhatsApp webhook verification:
-    GET /webhook?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...
-    """
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
+# ------------ Gmail send ------------
 
-    if mode == "subscribe" and token == WA_VERIFY_TOKEN:
-        return challenge, 200
-    return "Forbidden", 403
+def send_email_with_attachment(to_email: str, subject: str, body: str, attach_path: str):
+    if not have_gmail_env():
+        raise RuntimeError("Missing Gmail env vars (GMAIL_CLIENT_ID / SECRET / REFRESH_TOKEN / SENDER)")
 
-@app.route("/webhook", methods=["POST"])
-def webhook_receive():
-    """
-    Handle WhatsApp webhook messages.
-    """
-    data = request.get_json(silent=True) or {}
-    # Basic extraction of the incoming message
-    try:
-        entry = data["entry"][0]
-        changes = entry["changes"][0]
-        value = changes["value"]
-        messages = value.get("messages")
-        if not messages:
-            return "ok", 200
-        msg = messages[0]
-        from_phone = msg["from"]          # E.164
-        txt = msg.get("text", {}).get("body", "").strip()
-    except Exception:
-        return "ok", 200
+    sender = os.environ["GMAIL_SENDER"]
 
-    print(f"Incoming text from {from_phone} : {txt}")
+    msg = MIMEMultipart()
+    msg["To"] = to_email
+    msg["From"] = sender
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
 
-    # Parse locally
-    ctx = parse_fields(txt)
-    missing = missing_fields(ctx)
-
-    if missing:
-        # Ask the user to send in the example format
-        send_whatsapp_text(from_phone, PROMPT_EXAMPLE)
-        return "ok", 200
-
-    # Build and send email
-    try:
-        subject = f"Quotation from NIVEE METAL PRODUCTS PVT LTD"
-        html = html_quote(ctx)
-        plain = (
-            f"Dear {ctx['customer_name']},\n\n"
-            f"Product: {ctx['product']}\n"
-            f"Quantity: {ctx['quantity']} {ctx['units']}\n"
-            f"Rate: {ctx['rate']} per {ctx['units']}\n\n"
-            f"Regards,\nNIVEE METAL PRODUCTS PVT LTD\n"
+    with open(attach_path, "rb") as f:
+        part = MIMEBase(
+            "application",
+            "vnd.openxmlformats-officedocument.wordprocessingml.document"
         )
-        send_gmail(ctx["email"], subject, html, plain)
-        send_whatsapp_text(from_phone, f"Quotation sent to {ctx['email']} ✅")
+        part.set_payload(f.read())
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(attach_path)}"')
+    msg.attach(part)
+
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+    service = gmail_service()
+    try:
+        sent = service.users().messages().send(userId="me", body={"raw": raw}).execute()
+        return sent.get("id")
+    except HttpError as e:
+        raise RuntimeError(f"Gmail API error: {e}")
+
+# ------------ Routes ------------
+
+@app.get("/health")
+def health():
+    return jsonify({
+        "service": "quotation-bot",
+        "status": "ok",
+        "gmail_ready": have_gmail_env(),
+        "time": datetime.utcnow().isoformat() + "Z"
+    })
+
+@app.post("/send_quote")
+def send_quote():
+    """
+    Body JSON example:
+    {
+      "q_no": "110",
+      "date": "2025-11-06",
+      "company_name": "NIVEE METAL PRODUCTS PVT LTD",
+      "customer_name": "Rudra",
+      "product": "5 inch SS 316L sheets",
+      "quantity": "5",
+      "rate": "25000",
+      "units": "Pcs",
+      "hsn": "7219",
+      "email": "vip.vedant3@gmail.com"
+    }
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        if not data.get("email"):
+            return jsonify({"ok": False, "error": "Missing 'email'"}), 400
+
+        # 1) Fill your Template.docx
+        fp = build_quote_from_template(data)
+
+        # 2) Email
+        subject = f"Quotation {data.get('q_no','')} - {data.get('customer_name','')}".strip(" -")
+        body = (
+            f"Dear {data.get('customer_name','')},\n\n"
+            f"Please find attached the quotation.\n\n"
+            f"Regards,\n{data.get('company_name','')}"
+        )
+        msg_id = send_email_with_attachment(data["email"], subject or "Quotation", body, fp)
+
+        return jsonify({"ok": True, "gmail_message_id": msg_id, "file": os.path.basename(fp)})
     except Exception as e:
-        print("Email send error:", e)
-        send_whatsapp_text(from_phone, f"Sorry, I created the quote but couldn't send the email to {ctx['email']}.")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-    return "ok", 200
-
-# =========================
-#  Run (for local dev)
-# =========================
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
