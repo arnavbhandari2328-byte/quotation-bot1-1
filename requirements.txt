@@ -1,8 +1,13 @@
-Flask==3.0.0
-google-generativeai==0.5.2
+# --- Core framework ---
+Flask==3.0.3
 requests==2.32.3
-docxtpl==0.16.7
-python-docx==1.1.2
-lxml==5.3.0
-Pillow==10.4.0
-gunicorn==21.2.0
+
+# --- Google Gmail API ---
+google-api-python-client==2.137.0
+google-auth==2.35.0
+google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.1
+
+# --- Utilities ---
+python-dotenv==1.0.1
+gunicorn==23.0.0
