@@ -2,3 +2,6 @@ Flask
 python-dotenv
 google-generativeai
 docxtpl
+yagmail
+requests
+gunicorn
