@@ -3,10 +3,11 @@ import re
 import json
 import datetime
 import logging
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from dotenv import load_dotenv
 import google.generativeai as genai
 from docxtpl import DocxTemplate
+import yagmail
 
 # Load environment variables from .env
 load_dotenv()
@@ -94,6 +95,36 @@ def _regex_fallback(text: str):
     return _normalize_context(ctx)
 
 
+# Helper to create a full-path quotation using the existing create_quotation_doc
+def create_quotation(context: dict):
+    """Compatibility wrapper: returns full path to the generated docx or None."""
+    filename = create_quotation_doc(context)
+    if not filename:
+        return None
+    return os.path.join(os.getcwd(), filename)
+
+
+def send_email_with_attachment(recipient: str, subject: str, body: str, attachment_path: str) -> bool:
+    """Send an email with attachment using yagmail if credentials are available in env.
+
+    Returns True on success, False otherwise.
+    """
+    gmail_user = os.getenv("GMAIL_USER")
+    gmail_pass = os.getenv("GMAIL_PASS")
+    if not gmail_user or not gmail_pass:
+        logger.warning("GMAIL_USER or GMAIL_PASS not set; skipping email send")
+        return False
+
+    try:
+        yag = yagmail.SMTP(gmail_user, gmail_pass)
+        yag.send(to=recipient, subject=subject, contents=body, attachments=attachment_path)
+        logger.info("Email sent to %s", recipient)
+        return True
+    except Exception:
+        logger.exception("Failed to send email to %s", recipient)
+        return False
+
+
 def parse_command_with_ai(command_text: str):
     # 1) Try Gemini
     try:
@@ -120,6 +151,65 @@ Text: {command_text}
     # 2) Fallback to regex so the flow continues
     ctx = _regex_fallback(command_text)
     return ctx
+
+
+# (request/Response already imported at top; os and datetime are imported earlier)
+
+# WhatsApp webhook: supports both Meta format and a simple test format
+@app.route("/webhook", methods=["GET", "POST"])
+def whatsapp_webhook():
+    # --- Meta verification (GET) ---
+    if request.method == "GET":
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
+        if mode == "subscribe" and token == os.getenv("META_VERIFY_TOKEN"):
+            return Response(challenge or "", status=200)
+        return Response("Verification token mismatch", status=403)
+
+    # --- Message delivery (POST) ---
+    data = request.get_json(silent=True) or {}
+    # Try Meta’s structure first
+    text = None
+    try:
+        change = data["entry"][0]["changes"][0]
+        if "messages" in change["value"] and change["value"]["messages"]:
+            msg = change["value"]["messages"][0]
+            if msg.get("type") == "text":
+                text = msg["text"]["body"]
+    except Exception:
+        pass
+
+    # Fallback: simple emulator format { "message": "..." }
+    if not text:
+        text = data.get("message")
+
+    if not text:
+        return jsonify({"status": "ignored", "reason": "no text"}), 200
+
+    # Use your existing pipeline
+    context = parse_command_with_ai(text)
+    if not context:
+        return jsonify({"status": "error", "message": "Failed to parse message with Gemini"}), 200
+
+    doc_path = create_quotation_from_template(context) if "create_quotation_from_template" in globals() else create_quotation(context)
+    if not doc_path:
+        return jsonify({"status": "error", "message": "Failed to generate document"}), 200
+
+    subject = f"Quotation from NIVEE METAL PRODUCTS PVT LTD (Ref: {context.get('q_no', 'N/A')})"
+    body = f"""Dear {context['customer_name']},
+
+Thank you for your enquiry. Please find the quotation attached.
+
+Regards,
+Nivee Metal Products Pvt. Ltd.
+"""
+    email_ok = send_email_with_attachment(context.get("email", ""), subject, body, doc_path)
+
+    return jsonify({
+        "status": "ok" if email_ok else "mail_failed",
+        "file": os.path.basename(doc_path)
+    }), 200
 
 
 def create_quotation_doc(context: dict) -> str:
