@@ -157,7 +157,7 @@ Text: {command_text}
 
 # WhatsApp webhook: supports both Meta format and a simple test format
 @app.route("/webhook", methods=["GET", "POST"])
-def whatsapp_webhook():
+def webhook():
     # --- Meta verification (GET) ---
     if request.method == "GET":
         mode = request.args.get("hub.mode")
